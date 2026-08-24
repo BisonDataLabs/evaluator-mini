@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import runpy
+import sys
 from pathlib import Path
 
 os.environ["ELM_DEPLOYMENT_MODE"] = "upload_only"
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 runpy.run_path(Path(__file__).with_name("app_main.py"), run_name="__main__")

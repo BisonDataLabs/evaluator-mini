@@ -14,16 +14,18 @@ import streamlit as st
 from evaluador_lotes_mini.config import load_settings
 from evaluador_lotes_mini.geometry import area_hectares
 from evaluador_lotes_mini.ingestion.files import make_lot_ids_unique, read_uploaded_file
-from evaluador_lotes_mini.ingestion.snowflake import (
-    connection_available,
-    fetch_filter_groups,
-    fetch_lots,
-    search_lot_catalog,
-)
 from evaluador_lotes_mini.models import Lot, LotResult, ProcessingOptions
 from evaluador_lotes_mini.processor import process_batch
 from evaluador_lotes_mini.ui_charts import annual_rainfall_figure, quadrant_figure
 from evaluador_lotes_mini.ui_preview import render_raster
+
+if os.getenv("ELM_DEPLOYMENT_MODE", "local").lower() != "upload_only":
+    from evaluador_lotes_mini.ingestion.snowflake import (
+        connection_available,
+        fetch_filter_groups,
+        fetch_lots,
+        search_lot_catalog,
+    )
 
 MAX_LOTS_PER_BATCH = 10
 REFERENCE_SECONDS_PER_LOT = 8 * 60
