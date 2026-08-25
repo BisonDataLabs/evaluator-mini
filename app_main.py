@@ -105,7 +105,13 @@ with st.sidebar:
     buffer_m = st.number_input("Contexto alrededor del lote (m)", 0, 3000, 500, 100)
     max_cloud = st.slider("Nubosidad máxima (%)", 5, 80, 30, 5)
     seasons = st.slider("Campañas para estabilidad", 3, 12, 8)
-    zone_counts = st.multiselect("Alternativas de ambientes", [2, 3, 4, 5, 6], [2, 3, 4])
+    st.caption("Alternativas predeterminadas: 2, 3 y 4 ambientes.")
+    with st.expander("› Elegir más"):
+        zone_counts = st.multiselect(
+            "Alternativas de ambientes",
+            [2, 3, 4, 5, 6],
+            [2, 3, 4],
+        )
     quadrant_images = st.toggle("Imágenes por cuadrante climático", value=True)
     productivity = st.toggle("Estabilidad y ambientes", value=True)
     st.caption(
@@ -230,10 +236,7 @@ if lots:
     if not pending_lots:
         st.success("Todos los lotes cargados fueron procesados.")
     else:
-        st.write(
-            f"La herramienta procesa como máximo {MAX_LOTS_PER_BATCH} lotes por tanda. "
-            "Al finalizar, la siguiente tanda queda preparada automáticamente."
-        )
+        st.write("Se recomienda procesar no más de 10 lotes por tanda.")
     table = pd.DataFrame(
         [
             {
@@ -260,11 +263,9 @@ if lots:
         )
         selected_ids = set(edited.loc[edited["procesar"], "id"].astype(str))
         selected = [lot for lot in pending_lots if lot.lot_id in selected_ids]
-        batches_remaining = math.ceil(len(pending_lots) / MAX_LOTS_PER_BATCH)
         st.info(
             f"Tanda actual: {len(selected)} lotes · "
-            f"estimación {_duration(len(selected) * REFERENCE_SECONDS_PER_LOT)} · "
-            f"quedan aproximadamente {batches_remaining} tandas incluyendo esta."
+            f"estimación {_duration(len(selected) * REFERENCE_SECONDS_PER_LOT)}."
         )
         if len(selected) > MAX_LOTS_PER_BATCH:
             st.error(
@@ -310,13 +311,12 @@ if lots:
         st.session_state.last_elapsed = time.monotonic() - started
         st.success(
             f"Evaluación terminada en {_duration(st.session_state.last_elapsed)}. "
-            "Revise los resultados antes de descargar."
+            "Revisar los resultados antes de descargar."
         )
         remaining = len([lot for lot in lots if lot.lot_id not in completed])
         if remaining:
             st.info(
-                f"Quedan {remaining} lotes. Use “Preparar siguiente tanda” para continuar "
-                "sin volver a cargar los archivos ni buscarlos en Snowflake."
+                "Usar “Preparar siguiente tanda” para continuar sin volver a cargar los archivos."
             )
             if st.button("Preparar siguiente tanda"):
                 st.rerun()
@@ -448,10 +448,8 @@ def _render_result(result: LotResult) -> None:
   media y variabilidad temporal por píxel.
 - Los 30 m interiores al alambrado no entrenan la normalización ni K-Means. Al final se
   asigna a ese borde la clase interior más cercana para entregar capas completas.
-- **Ambientes:** se aplica **K-Means**, un agrupamiento rígido, sobre productividad relativa
-  y variabilidad estandarizadas. No es fuzzy: cada píxel pertenece a una sola zona.
-- Ambas variables tienen inicialmente el mismo peso después de estandarizarlas. No se usa
-  densidad aparente ni un peso agronómico manual.
+- **Ambientes:** se aplica **K-Means** sobre productividad relativa y variabilidad
+  estandarizadas.
 - La recomendación exige separación estadística y que ninguna zona ocupe menos del 10%.
   Aun así debe validarse con rendimiento, suelo, relieve y conocimiento del productor.
                     """
@@ -507,22 +505,17 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
                 width="stretch",
             )
 
-    legend = pd.DataFrame(
-        [
-            {
-                "color": f"#{red:02x}{green:02x}{blue:02x}",
-                "clase": class_id,
-                "significado": STABILITY_LABELS[class_id],
-            }
-            for class_id, (red, green, blue) in STABILITY_COLORS.items()
-        ]
-    )
     st.caption("Leyenda de estabilidad")
-    st.dataframe(
-        legend,
-        hide_index=True,
-        width="stretch",
+    legend_rows = "".join(
+        (
+            "<div style='display:flex;align-items:center;gap:.65rem;margin:.3rem 0'>"
+            f"<span style='width:1.35rem;height:1.35rem;border-radius:.2rem;"
+            f"background:rgb({red},{green},{blue});border:1px solid #777'></span>"
+            f"<span><b>Clase {class_id}</b> · {STABILITY_LABELS[class_id]}</span></div>"
+        )
+        for class_id, (red, green, blue) in STABILITY_COLORS.items()
     )
+    st.markdown(legend_rows, unsafe_allow_html=True)
 
     recommendation_file = environments_dir / "alternativas.json"
     if recommendation_file.exists():

@@ -58,7 +58,7 @@ class PlanetaryImagery:
             query={"eo:cloud_cover": {"lt": max_cloud_percent}},
             max_items=max_items,
         )
-        items = list(search.items())
+        items = _deduplicate_acquisitions(list(search.items()))
         return sorted(
             items,
             key=lambda item: (
@@ -87,16 +87,17 @@ class PlanetaryImagery:
             ),
         )[:candidates]
         grid = grid_for_geometry(geometry, resolution=30)
-        scored: list[tuple[float, Item]] = []
+        scored: list[tuple[float, float, Item]] = []
         for item in ranked:
             try:
                 ndvi, valid = _read_ndvi(item, grid)
-                score = float(np.nanmean(np.where(valid, ndvi, np.nan)))
-                if np.isfinite(score):
-                    scored.append((score, item))
+                values = ndvi[valid & np.isfinite(ndvi)]
+                valid_fraction = _valid_fraction(valid, grid.inside_mask)
+                if values.size and valid_fraction >= 0.25:
+                    scored.append((float(np.mean(values)), valid_fraction, item))
             except Exception:
                 continue
-        selected = max(scored, key=lambda pair: pair[0])[1] if scored else ranked[0]
+        selected = max(scored, key=lambda pair: (pair[0], pair[1]))[2] if scored else ranked[0]
         metadata = SelectedScene(
             item_id=selected.id,
             acquisition_date=(
@@ -169,7 +170,7 @@ class PlanetaryImagery:
             "buffer_m": buffer_m,
             "resolution_m": grid.resolution,
             "crs": grid.crs.to_string(),
-            "valid_pixel_percent": round(valid.mean() * 100, 1),
+            "valid_pixel_percent": round(_valid_fraction(valid, grid.inside_mask) * 100, 1),
             "products": {
                 "RGB": rgb_path.name,
                 "IR": ir_path.name,
@@ -258,3 +259,26 @@ def _coverage(item: Item, geometry: BaseGeometry) -> float:
 
 def _float_or_none(value: Any) -> float | None:
     return float(value) if value is not None else None
+
+
+def _deduplicate_acquisitions(items: list[Item]) -> list[Item]:
+    """Keep the newest processing baseline for each sensing time and MGRS tile."""
+    selected: dict[tuple[str, str], Item] = {}
+    for item in items:
+        sensing_time = item.datetime.isoformat() if item.datetime else item.id
+        tile = str(item.properties.get("s2:mgrs_tile") or _tile_from_item_id(item.id))
+        key = sensing_time, tile
+        previous = selected.get(key)
+        if previous is None or item.id > previous.id:
+            selected[key] = item
+    return list(selected.values())
+
+
+def _tile_from_item_id(item_id: str) -> str:
+    parts = item_id.split("_")
+    return parts[4] if len(parts) > 4 else item_id
+
+
+def _valid_fraction(valid: np.ndarray, footprint: np.ndarray) -> float:
+    denominator = int(np.count_nonzero(footprint))
+    return float(np.count_nonzero(valid & footprint) / denominator) if denominator else 0.0

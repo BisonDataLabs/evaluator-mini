@@ -124,12 +124,13 @@ def calculate_stability(
                             ndvi=ndvi.astype("float32"),
                             valid=valid.astype("uint8"),
                         )
-                record["valid_pixel_percent"] = round(float(valid.mean()) * 100, 1)
+                valid_fraction = _valid_fraction(valid, grid.inside_mask)
+                record["valid_pixel_percent"] = round(valid_fraction * 100, 1)
                 if not preview_path.exists():
                     if false_color is None:
                         _, _, false_color = read_ndvi_false_color(item, grid)
                     _write_false_color_preview(false_color, preview_path, f"{label} · {acquired}")
-                if valid.mean() < 0.25:
+                if valid_fraction < 0.25:
                     record["included"] = False
                     record["reason"] = "menos de 25% de píxeles válidos"
                 elif item.id in excluded:
@@ -326,3 +327,8 @@ def _safe_id(value: str) -> str:
 
 def _float_or_none(value: Any) -> float | None:
     return float(value) if value is not None else None
+
+
+def _valid_fraction(valid: np.ndarray, footprint: np.ndarray) -> float:
+    denominator = int(np.count_nonzero(footprint))
+    return float(np.count_nonzero(valid & footprint) / denominator) if denominator else 0.0
