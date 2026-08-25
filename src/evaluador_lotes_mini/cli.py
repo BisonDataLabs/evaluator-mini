@@ -30,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stability-seasons", type=int, default=8)
     parser.add_argument("--max-cloud", type=float, default=30)
     parser.add_argument("--zones", type=int, nargs="+", default=[2, 3, 4])
+    parser.add_argument("--edge-exclusion-m", type=int, default=30)
+    parser.add_argument("--no-scene-cache", action="store_true")
     parser.add_argument("--skip-quadrant-images", action="store_true")
     parser.add_argument("--skip-productivity", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
@@ -58,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         stability_seasons=args.stability_seasons,
         max_cloud_percent=args.max_cloud,
         zone_counts=tuple(sorted(set(args.zones))),
+        edge_exclusion_m=args.edge_exclusion_m,
+        cache_review_arrays=not args.no_scene_cache,
         export_quadrant_imagery=not args.skip_quadrant_images,
         calculate_productivity=not args.skip_productivity,
     )

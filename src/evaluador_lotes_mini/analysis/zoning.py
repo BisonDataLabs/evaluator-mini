@@ -34,9 +34,7 @@ def build_zone_alternatives(
     zone_counts: tuple[int, ...] = (2, 3, 4),
     min_patch_area_m2: float = 1_000,
 ) -> list[ZoneAlternative]:
-    valid = (
-        stability.grid.inside_mask & np.isfinite(stability.z_mean) & np.isfinite(stability.z_std)
-    )
+    valid = stability.analysis_mask & np.isfinite(stability.z_mean) & np.isfinite(stability.z_std)
     features = np.column_stack([stability.z_mean[valid], stability.z_std[valid]])
     if features.shape[0] < 50:
         raise RuntimeError("Muy pocos píxeles válidos para zonificar")

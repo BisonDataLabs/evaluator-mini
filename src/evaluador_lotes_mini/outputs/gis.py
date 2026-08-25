@@ -8,7 +8,7 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
-from rasterio.features import shapes
+from rasterio.features import rasterize, shapes
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
@@ -27,19 +27,32 @@ def write_geopackage(
     lot: Lot,
     stability: StabilityResult,
     alternatives: list[ZoneAlternative],
+    campaign_type: str,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
     target_crs = stability.grid.crs
     lot_metric = reproject(lot.geometry, "EPSG:4326", target_crs)
     gpd.GeoDataFrame(
-        [{"lot_id": lot.lot_id, "name": lot.name, "source": lot.source, "geometry": lot_metric}],
+        [{
+            "lot_id": lot.lot_id,
+            "name": lot.name,
+            "source": lot.source,
+            "campaign": campaign_type,
+            "geometry": lot_metric,
+        }],
         crs=target_crs,
     ).to_file(path, layer="perimetro", driver="GPKG")
 
-    stability_rows = _stability_polygons(stability)
-    if stability_rows:
-        gpd.GeoDataFrame(stability_rows, geometry="geometry", crs=target_crs).to_file(
-            path, layer="estabilidad_5_clases", driver="GPKG"
+    stability_patches = _stability_patches(stability)
+    if stability_patches:
+        gpd.GeoDataFrame(stability_patches, geometry="geometry", crs=target_crs).to_file(
+            path, layer="estabilidad_parches", driver="GPKG"
+        )
+        dissolved = _dissolve_stability(stability_patches)
+        gpd.GeoDataFrame(dissolved, geometry="geometry", crs=target_crs).to_file(
+            path, layer="estabilidad_disuelta", driver="GPKG"
         )
 
     for alternative in alternatives:
@@ -68,8 +81,9 @@ def write_stability_csv(path: Path, stability: StabilityResult) -> Path:
     return write_rows_csv(path, stability_statistics(stability))
 
 
-def _stability_polygons(stability: StabilityResult) -> list[dict[str, Any]]:
-    grouped: dict[int, list] = {class_id: [] for class_id in STABILITY_LABELS}
+def _stability_patches(stability: StabilityResult) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    patch_id = 0
     for geometry, value in shapes(
         stability.classes,
         mask=stability.classes > 0,
@@ -77,22 +91,54 @@ def _stability_polygons(stability: StabilityResult) -> list[dict[str, Any]]:
     ):
         class_id = int(value)
         polygon = shape(geometry)
-        if polygon.area >= 500:
-            grouped[class_id].append(polygon)
-    pixel_area_ha = stability.grid.resolution**2 / 10_000
+        if polygon.area > 0:
+            patch_id += 1
+            mask = rasterize(
+                [(polygon, 1)],
+                out_shape=stability.grid.shape,
+                transform=stability.grid.transform,
+                fill=0,
+            ).astype(bool)
+            mask &= stability.classes == class_id
+            rows.append(
+                {
+                    "patch_id": patch_id,
+                    "campaign": stability.campaign_type,
+                    "class_id": class_id,
+                    "label": STABILITY_LABELS[class_id],
+                    "hectares": round(polygon.area / 10_000, 3),
+                    "z_mean": round(float(np.nanmean(stability.z_mean[mask])), 3),
+                    "z_std": round(float(np.nanmean(stability.z_std[mask])), 3),
+                    "geometry": polygon.simplify(stability.grid.resolution),
+                }
+            )
+    return rows
+
+
+def _dissolve_stability(patches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for class_id, polygons in grouped.items():
-        if not polygons:
+    for class_id, label in STABILITY_LABELS.items():
+        selected = [row for row in patches if row["class_id"] == class_id]
+        if not selected:
             continue
-        mask = stability.classes == class_id
+        hectares = sum(float(row["hectares"]) for row in selected)
         rows.append(
             {
                 "class_id": class_id,
-                "label": STABILITY_LABELS[class_id],
-                "hectares": round(int(np.count_nonzero(mask)) * pixel_area_ha, 2),
-                "z_mean": round(float(np.nanmean(stability.z_mean[mask])), 3),
-                "z_std": round(float(np.nanmean(stability.z_std[mask])), 3),
-                "geometry": unary_union(polygons).simplify(stability.grid.resolution),
+                "campaign": selected[0]["campaign"],
+                "label": label,
+                "hectares": round(hectares, 3),
+                "z_mean": round(
+                    sum(float(row["z_mean"]) * float(row["hectares"]) for row in selected)
+                    / hectares,
+                    3,
+                ),
+                "z_std": round(
+                    sum(float(row["z_std"]) * float(row["hectares"]) for row in selected)
+                    / hectares,
+                    3,
+                ),
+                "geometry": unary_union([row["geometry"] for row in selected]),
             }
         )
     return rows

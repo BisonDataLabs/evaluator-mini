@@ -11,13 +11,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from evaluador_lotes_mini.analysis.stability import STABILITY_LABELS
 from evaluador_lotes_mini.config import load_settings
 from evaluador_lotes_mini.geometry import area_hectares
 from evaluador_lotes_mini.ingestion.files import make_lot_ids_unique, read_uploaded_file
 from evaluador_lotes_mini.models import Lot, LotResult, ProcessingOptions
-from evaluador_lotes_mini.processor import process_batch
+from evaluador_lotes_mini.processor import process_batch, recalculate_productivity_campaign
 from evaluador_lotes_mini.ui_charts import annual_rainfall_figure, quadrant_figure
-from evaluador_lotes_mini.ui_preview import render_raster
+from evaluador_lotes_mini.ui_preview import STABILITY_COLORS, render_raster
 
 if os.getenv("ELM_DEPLOYMENT_MODE", "local").lower() != "upload_only":
     from evaluador_lotes_mini.ingestion.snowflake import (
@@ -28,7 +29,7 @@ if os.getenv("ELM_DEPLOYMENT_MODE", "local").lower() != "upload_only":
     )
 
 MAX_LOTS_PER_BATCH = 10
-REFERENCE_SECONDS_PER_LOT = 8 * 60
+REFERENCE_SECONDS_PER_LOT = 14 * 60
 SNOWFLAKE_ENABLED = os.getenv("ELM_DEPLOYMENT_MODE", "local").lower() != "upload_only"
 st.set_page_config(page_title="Evaluador de lotes mini", page_icon="🌱", layout="wide")
 
@@ -104,10 +105,13 @@ with st.sidebar:
     buffer_m = st.number_input("Contexto alrededor del lote (m)", 0, 3000, 500, 100)
     max_cloud = st.slider("Nubosidad máxima (%)", 5, 80, 30, 5)
     seasons = st.slider("Campañas para estabilidad", 3, 12, 8)
-    zone_counts = st.multiselect("Alternativas de ambientes", [2, 3, 4, 5], [2, 3, 4])
+    zone_counts = st.multiselect("Alternativas de ambientes", [2, 3, 4, 5, 6], [2, 3, 4])
     quadrant_images = st.toggle("Imágenes por cuadrante climático", value=True)
     productivity = st.toggle("Estabilidad y ambientes", value=True)
-    st.caption("Referencia observada: un lote completo tarda aproximadamente 7–10 minutos.")
+    st.caption(
+        "Estimación inicial con estabilidad separada de fina y gruesa: "
+        "aproximadamente 12–18 minutos por lote."
+    )
 
 upload_tab, snowflake_tab = st.tabs(
     ["Subir archivos", "Snowflake" if SNOWFLAKE_ENABLED else "Snowflake · solo local"]
@@ -277,6 +281,8 @@ if lots:
             stability_seasons=int(seasons),
             max_cloud_percent=float(max_cloud),
             zone_counts=tuple(zone_counts),
+            edge_exclusion_m=30,
+            cache_review_arrays=SNOWFLAKE_ENABLED,
             export_quadrant_imagery=quadrant_images,
             calculate_productivity=productivity,
         )
@@ -417,25 +423,31 @@ def _render_result(result: LotResult) -> None:
                 f"buffer: {metadata.get('buffer_m', 0)} m"
             )
             for column, product in zip(st.columns(3), ["RGB", "IR", "NDVI"], strict=True):
-                raster = scene_dir / f"{product}.tif"
+                raster = scene_dir / metadata.get("products", {}).get(product, f"{product}.tif")
                 column.image(
                     cached_preview(
                         str(raster), raster.stat().st_mtime, str(boundary), boundary.stat().st_mtime
                     ),
-                    caption=f"{product} · borde amarillo = lote",
+                    caption=f"{product} · {metadata.get('date', '')} · borde amarillo = lote",
                     width="stretch",
                 )
 
-        stability = root / "estabilidad" / "estabilidad_5_clases.tif"
-        alternatives = sorted((root / "ambientes").glob("ambientes_k*.tif"))
-        if stability.exists():
+        stability_branches = [
+            branch
+            for branch in ("gruesa", "fina")
+            if (root / "estabilidad" / branch / "estabilidad_5_clases.tif").exists()
+        ]
+        if stability_branches:
             st.subheader("Estabilidad y ambientes productivos")
             with st.expander("Cómo se calcularon estas capas"):
                 st.markdown(
                     """
-- **Estabilidad:** para cada campaña se construye el máximo NDVI libre de nubes. Cada
+- **Fina y gruesa se calculan por separado.** Para cada campaña se construye el máximo
+  NDVI libre de nubes. Cada
   campaña se normaliza respecto del propio lote; luego se calcula productividad relativa
   media y variabilidad temporal por píxel.
+- Los 30 m interiores al alambrado no entrenan la normalización ni K-Means. Al final se
+  asigna a ese borde la clase interior más cercana para entregar capas completas.
 - **Ambientes:** se aplica **K-Means**, un agrupamiento rígido, sobre productividad relativa
   y variabilidad estandarizadas. No es fuzzy: cada píxel pertenece a una sola zona.
 - Ambas variables tienen inicialmente el mismo peso después de estandarizarlas. No se usa
@@ -444,34 +456,10 @@ def _render_result(result: LotResult) -> None:
   Aun así debe validarse con rendimiento, suelo, relieve y conocimiento del productor.
                     """
                 )
-            rasters = [stability, *alternatives]
-            columns = st.columns(len(rasters))
-            for column, raster in zip(columns, rasters, strict=True):
-                column.image(
-                    cached_preview(
-                        str(raster), raster.stat().st_mtime, str(boundary), boundary.stat().st_mtime
-                    ),
-                    caption=raster.stem.replace("_", " ").capitalize(),
-                    width="stretch",
-                )
-            recommendation_file = root / "ambientes" / "alternativas.json"
-            if recommendation_file.exists():
-                recommendation = json.loads(recommendation_file.read_text(encoding="utf-8"))
-                if recommendation.get("recommended_k"):
-                    st.info(
-                        f"Alternativa estadísticamente recomendada: "
-                        f"{recommendation.get('recommended_k')} ambientes. "
-                        "Debe validarse agronómicamente."
-                    )
-                else:
-                    st.warning(
-                        "No hay una alternativa robusta para recomendar automáticamente: "
-                        "al menos un ambiente sería demasiado pequeño. Revise las capas junto "
-                        "con rendimiento, suelo y conocimiento del lote."
-                    )
-            statistics_file = root / "estabilidad" / "estadisticas.csv"
-            if statistics_file.exists():
-                st.dataframe(pd.read_csv(statistics_file), hide_index=True, width="stretch")
+            branch_tabs = st.tabs([branch.capitalize() for branch in stability_branches])
+            for branch_tab, branch in zip(branch_tabs, stability_branches, strict=True):
+                with branch_tab:
+                    _render_productivity_branch(result, branch, boundary)
 
         package = result.output_dir.parent / f"{result.output_dir.name}.zip"
         if package.exists():
@@ -483,6 +471,208 @@ def _render_result(result: LotResult) -> None:
                 key=f"download-{result.lot_id}",
                 type="primary",
             )
+
+
+def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) -> None:
+    root = result.output_dir
+    stability_dir = root / "estabilidad" / branch
+    environments_dir = root / "ambientes" / branch
+    stability = stability_dir / "estabilidad_5_clases.tif"
+    alternatives = sorted(environments_dir.glob("ambientes_k*.tif"))
+    review_file = stability_dir / "revision_humana.json"
+    if review_file.exists():
+        review = json.loads(review_file.read_text(encoding="utf-8"))
+        st.success(
+            f"Resultado revisado · {len(review.get('excluded_item_ids', []))} "
+            "escenas excluidas · el ZIP ya contiene el recálculo."
+        )
+    else:
+        st.caption(
+            "Resultado preliminar listo para descargar. La revisión de escenas es opcional."
+        )
+    rasters = [stability, *alternatives]
+    for offset in range(0, len(rasters), 3):
+        row = rasters[offset : offset + 3]
+        for column, raster in zip(st.columns(len(row)), row, strict=True):
+            title = (
+                f"Estabilidad de {branch} · 5 clases"
+                if raster == stability
+                else f"{branch.capitalize()} · {raster.stem.replace('_', ' ')}"
+            )
+            column.image(
+                cached_preview(
+                    str(raster), raster.stat().st_mtime, str(boundary), boundary.stat().st_mtime
+                ),
+                caption=title,
+                width="stretch",
+            )
+
+    legend = pd.DataFrame(
+        [
+            {
+                "color": f"#{red:02x}{green:02x}{blue:02x}",
+                "clase": class_id,
+                "significado": STABILITY_LABELS[class_id],
+            }
+            for class_id, (red, green, blue) in STABILITY_COLORS.items()
+        ]
+    )
+    st.caption("Leyenda de estabilidad")
+    st.dataframe(
+        legend,
+        hide_index=True,
+        width="stretch",
+    )
+
+    recommendation_file = environments_dir / "alternativas.json"
+    if recommendation_file.exists():
+        recommendation = json.loads(recommendation_file.read_text(encoding="utf-8"))
+        effective_edge = recommendation.get("edge_training_exclusion_m", 30)
+        st.caption(f"Borde excluido del ajuste: {effective_edge} m.")
+        if recommendation.get("recommended_k"):
+            st.info(
+                f"Alternativa estadísticamente recomendada para {branch}: "
+                f"{recommendation.get('recommended_k')} ambientes. "
+                "Debe validarse agronómicamente."
+            )
+        else:
+            st.warning(
+                f"No hay una alternativa robusta para recomendar automáticamente en {branch}. "
+                "Revise tamaños, formas y evidencia agronómica."
+            )
+    statistics_file = stability_dir / "estadisticas.csv"
+    if statistics_file.exists():
+        st.dataframe(pd.read_csv(statistics_file), hide_index=True, width="stretch")
+
+    inventory_file = stability_dir / "escenas_utilizadas.json"
+    if not inventory_file.exists():
+        return
+    with st.expander(f"Revisar o excluir imágenes de {branch}"):
+        inventory = json.loads(inventory_file.read_text(encoding="utf-8"))
+        campaigns = sorted({str(row["campaign"]) for row in inventory})
+        campaign_filter = st.selectbox(
+            "Campaña para inspeccionar",
+            ["Todas", *campaigns],
+            key=f"campaign-filter-{result.lot_id}-{branch}",
+        )
+        visible = [
+            row
+            for row in inventory
+            if campaign_filter == "Todas" or row["campaign"] == campaign_filter
+        ]
+        review_table = pd.DataFrame(
+            [
+                {
+                    "excluir": row.get("reason") == "excluida por el usuario",
+                    "campaña": row.get("campaign"),
+                    "fecha": row.get("date"),
+                    "nubosidad_%": row.get("cloud_percent"),
+                    "píxeles_válidos_%": row.get("valid_pixel_percent"),
+                    "estado": row.get("reason", "incluida"),
+                    "item_id": row.get("item_id"),
+                }
+                for row in visible
+            ]
+        )
+        edited = st.data_editor(
+            review_table,
+            hide_index=True,
+            width="stretch",
+            disabled=[
+                "campaña",
+                "fecha",
+                "nubosidad_%",
+                "píxeles_válidos_%",
+                "estado",
+                "item_id",
+            ],
+            key=(
+                f"scene-review-{result.lot_id}-{branch}-{campaign_filter}-"
+                f"{inventory_file.stat().st_mtime_ns}"
+            ),
+        )
+        full_campaigns = st.multiselect(
+            "Excluir campañas completas",
+            campaigns,
+            key=f"excluded-campaigns-{result.lot_id}-{branch}",
+        )
+        preview_choices = {
+            f"{row.get('campaign')} · {row.get('date')} · {row.get('item_id')}": row
+            for row in visible
+            if (stability_dir / str(row.get("preview", ""))).exists()
+        }
+        if preview_choices:
+            preview_choice = st.selectbox(
+                "Vista falso color",
+                list(preview_choices),
+                key=f"scene-preview-{result.lot_id}-{branch}",
+            )
+            preview = stability_dir / preview_choices[preview_choice]["preview"]
+            st.image(str(preview), caption=preview_choice, width="stretch")
+
+        visible_ids = {str(row["item_id"]) for row in visible}
+        excluded_ids = {
+            str(row["item_id"])
+            for row in inventory
+            if row.get("reason") == "excluida por el usuario"
+            and str(row["item_id"]) not in visible_ids
+        }
+        excluded_ids.update(edited.loc[edited["excluir"], "item_id"].astype(str))
+        excluded_ids.update(
+            str(row["item_id"]) for row in inventory if row["campaign"] in full_campaigns
+        )
+        matching_lot = next(
+            (lot for lot in st.session_state.lots if lot.lot_id == result.lot_id), None
+        )
+        remaining_campaigns = {
+            str(row["campaign"])
+            for row in inventory
+            if str(row["item_id"]) not in excluded_ids
+            and float(row.get("valid_pixel_percent") or 0) >= 25
+        }
+        insufficient_campaigns = len(remaining_campaigns) < 3
+        if insufficient_campaigns:
+            st.warning(
+                "La selección dejaría menos de tres campañas utilizables. "
+                "Conserve imágenes de al menos tres campañas para poder recalcular."
+            )
+        if st.button(
+            f"Recalcular sólo {branch}",
+            disabled=matching_lot is None or insufficient_campaigns,
+            key=f"recalculate-{result.lot_id}-{branch}",
+        ):
+            options = ProcessingOptions(
+                buffer_m=int(buffer_m),
+                stability_seasons=int(seasons),
+                max_cloud_percent=float(max_cloud),
+                zone_counts=tuple(zone_counts),
+                edge_exclusion_m=30,
+                cache_review_arrays=SNOWFLAKE_ENABLED,
+                export_quadrant_imagery=quadrant_images,
+                calculate_productivity=productivity,
+            )
+            bar = st.progress(0.0)
+            message = st.empty()
+
+            def review_progress(label: str, fraction: float) -> None:
+                message.write(label)
+                bar.progress(fraction)
+
+            try:
+                recalculate_productivity_campaign(
+                    matching_lot,
+                    root,
+                    options,
+                    branch,
+                    excluded_ids,
+                    progress=review_progress,
+                )
+            except Exception as exc:
+                st.error(f"No se pudo recalcular {branch}: {exc}")
+                return
+            cached_preview.clear()
+            st.success(f"Se recalculó {branch} y se actualizó el ZIP del lote.")
+            st.rerun()
 
 
 def _elapsed_from_files(root: Path) -> float:

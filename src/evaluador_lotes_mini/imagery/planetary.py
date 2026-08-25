@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from calendar import monthrange
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -113,6 +114,7 @@ class PlanetaryImagery:
         lot_geometry: BaseGeometry,
         output_dir: Path,
         buffer_m: int = 500,
+        file_prefix: str | None = None,
     ) -> tuple[list[Path], dict[str, Any]]:
         context = buffered_wgs84(lot_geometry, buffer_m)
         grid = grid_for_geometry(context)
@@ -135,8 +137,9 @@ class PlanetaryImagery:
         good = valid & (denominator != 0)
         ndvi[good] = (nir[good] - red[good]) / denominator[good]
 
+        prefix = f"{file_prefix}_" if file_prefix else ""
         rgb_path = write_raster(
-            output_dir / "RGB.tif",
+            output_dir / f"{prefix}RGB.tif",
             [red, green, blue],
             grid,
             dtype="uint16",
@@ -144,7 +147,7 @@ class PlanetaryImagery:
             descriptions=["Red", "Green", "Blue"],
         )
         ir_path = write_raster(
-            output_dir / "IR.tif",
+            output_dir / f"{prefix}IR.tif",
             [nir, red, green],
             grid,
             dtype="uint16",
@@ -152,7 +155,7 @@ class PlanetaryImagery:
             descriptions=["NIR", "Red", "Green"],
         )
         ndvi_path = write_raster(
-            output_dir / "NDVI.tif",
+            output_dir / f"{prefix}NDVI.tif",
             ndvi,
             grid,
             dtype="float32",
@@ -167,6 +170,11 @@ class PlanetaryImagery:
             "resolution_m": grid.resolution,
             "crs": grid.crs.to_string(),
             "valid_pixel_percent": round(valid.mean() * 100, 1),
+            "products": {
+                "RGB": rgb_path.name,
+                "IR": ir_path.name,
+                "NDVI": ndvi_path.name,
+            },
         }
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "metadata.json").write_text(
@@ -177,9 +185,10 @@ class PlanetaryImagery:
 
 def campaign_dates(campaign: str, year: int) -> tuple[date, date]:
     if campaign == "gruesa":
-        return date(year, 10, 1), date(year + 1, 3, 31)
+        image_year = year + 1
+        return date(image_year, 1, 1), date(image_year, 2, monthrange(image_year, 2)[1])
     if campaign == "fina":
-        return date(year, 4, 1), date(year, 9, 30)
+        return date(year, 9, 1), date(year, 10, 31)
     raise ValueError(f"Campaña desconocida: {campaign}")
 
 
@@ -214,6 +223,28 @@ def _read_ndvi(item: Item, grid: RasterGrid) -> tuple[np.ndarray, np.ndarray]:
 def read_ndvi(item: Item, grid: RasterGrid) -> tuple[np.ndarray, np.ndarray]:
     """Public aligned NDVI reader used by temporal analyses."""
     return _read_ndvi(item, grid)
+
+
+def read_ndvi_false_color(
+    item: Item, grid: RasterGrid
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read aligned NDVI plus NIR/red/green bands for visual scene review."""
+    red = read_asset(item.assets["B04"].href, grid)
+    green = read_asset(item.assets["B03"].href, grid)
+    nir = read_asset(item.assets["B08"].href, grid)
+    scl = read_asset(
+        item.assets["SCL"].href,
+        grid,
+        resampling=Resampling.nearest,
+        dtype="uint8",
+        nodata=0,
+    )
+    valid = np.isin(scl, list(CLEAR_SCL)) & grid.inside_mask & ((nir + red) != 0)
+    ndvi = np.full(grid.shape, np.nan, dtype="float32")
+    ndvi[valid] = (nir[valid] - red[valid]) / (nir[valid] + red[valid])
+    false_color = np.stack([nir, red, green]).astype("float32")
+    false_color[:, ~valid] = np.nan
+    return ndvi, valid, false_color
 
 
 def _coverage(item: Item, geometry: BaseGeometry) -> float:

@@ -49,6 +49,8 @@ class ProcessingOptions:
     stability_seasons: int = 8
     max_cloud_percent: float = 30.0
     zone_counts: tuple[int, ...] = (2, 3, 4)
+    edge_exclusion_m: int = 30
+    cache_review_arrays: bool = True
     export_quadrant_imagery: bool = True
     calculate_productivity: bool = True
 

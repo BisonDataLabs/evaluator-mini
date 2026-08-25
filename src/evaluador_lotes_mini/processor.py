@@ -14,7 +14,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from evaluador_lotes_mini.analysis.stability import calculate_stability
+from evaluador_lotes_mini.analysis.stability import CampaignType, calculate_stability
 from evaluador_lotes_mini.analysis.zoning import (
     build_zone_alternatives,
     recommended_zone_count,
@@ -166,7 +166,13 @@ def process_lot(
                         max_cloud_percent=options.max_cloud_percent,
                     )
                     artifacts, metadata = imagery.export_scene_products(
-                        item, lot.geometry, scene_dir, buffer_m=options.buffer_m
+                        item,
+                        lot.geometry,
+                        scene_dir,
+                        buffer_m=options.buffer_m,
+                        file_prefix=(
+                            f"{campaign}_{safe_slug(quadrant)}_{selection.acquisition_date}"
+                        ),
                     )
                     metadata.update(
                         {
@@ -184,60 +190,19 @@ def process_lot(
         _write_json(output_dir / "imagenes_cuadrantes" / "manifest.json", scene_manifest)
 
         if options.calculate_productivity:
-            _notify(progress, f"{lot.name}: estabilidad multitemporal", 0.52)
-            stability = calculate_stability(
-                imagery,
-                lot.geometry,
-                output_dir / "estabilidad",
-                seasons=options.stability_seasons,
-                max_cloud_percent=options.max_cloud_percent,
-                progress=lambda completed, total, campaign: _notify(
-                    progress,
-                    f"{lot.name}: estabilidad {completed}/{total} ({campaign})",
-                    0.52 + 0.28 * completed / total,
-                ),
-            )
-            result.artifacts.extend(stability.artifacts)
-            _write_json(output_dir / "estabilidad" / "campanas_utilizadas.json", stability.seasons)
-            write_stability_csv(output_dir / "estabilidad" / "estadisticas.csv", stability)
-
-            _notify(progress, f"{lot.name}: ambientes productivos", 0.82)
-            alternatives = build_zone_alternatives(
-                stability, output_dir / "ambientes", options.zone_counts
-            )
-            geopackage = write_geopackage(
-                output_dir / "gis" / f"{safe_slug(lot.name)}.gpkg",
-                lot,
-                stability,
-                alternatives,
-            )
-            recommendation = recommended_zone_count(alternatives)
-            _write_json(
-                output_dir / "ambientes" / "alternativas.json",
-                {
-                    "method": "KMeans",
-                    "membership": "hard",
-                    "features": [
-                        {"name": "productividad_media_relativa", "weight": 1.0},
-                        {"name": "variabilidad_temporal", "weight": 1.0},
-                    ],
-                    "preprocessing": "StandardScaler",
-                    "minimum_zone_share_percent": 10,
-                    "minimum_silhouette": 0.25,
-                    "edge_training_exclusion_m": 20,
-                    "recommended_k": recommendation,
-                    "alternatives": [
-                        {
-                            "k": item.k,
-                            "silhouette": round(item.silhouette, 4),
-                            "zone_percentages": item.zone_percentages,
-                            "passes_minimum_zone_share": min(item.zone_percentages.values()) >= 10,
-                        }
-                        for item in alternatives
-                    ],
-                },
-            )
-            result.artifacts.extend([geopackage, *(item.raster_path for item in alternatives)])
+            for index, campaign_type in enumerate(("gruesa", "fina")):
+                result.artifacts.extend(
+                    _process_productivity_campaign(
+                        lot,
+                        output_dir,
+                        imagery,
+                        options,
+                        campaign_type,
+                        progress=progress,
+                        progress_start=0.50 + index * 0.20,
+                        progress_end=0.70 + index * 0.20,
+                    )
+                )
 
         _copy_qgis_assets(output_dir)
         _write_report(output_dir, lot, options, result, scene_manifest)
@@ -253,6 +218,122 @@ def process_lot(
     if result.status == "completed":
         _write_json(done_file, result.manifest_dict())
     return result
+
+
+def recalculate_productivity_campaign(
+    lot: Lot,
+    output_dir: Path,
+    options: ProcessingOptions,
+    campaign_type: CampaignType,
+    excluded_item_ids: set[str],
+    *,
+    progress: ProgressCallback | None = None,
+) -> Path:
+    """Rebuild one productivity branch from cached scenes after human review."""
+    imagery = PlanetaryImagery()
+    _process_productivity_campaign(
+        lot,
+        output_dir,
+        imagery,
+        options,
+        campaign_type,
+        excluded_item_ids=excluded_item_ids,
+        progress=progress,
+        progress_start=0.0,
+        progress_end=1.0,
+    )
+    return _zip_lot(output_dir)
+
+
+def _process_productivity_campaign(
+    lot: Lot,
+    output_dir: Path,
+    imagery: PlanetaryImagery,
+    options: ProcessingOptions,
+    campaign_type: CampaignType,
+    *,
+    excluded_item_ids: set[str] | None = None,
+    progress: ProgressCallback | None = None,
+    progress_start: float,
+    progress_end: float,
+) -> list[Path]:
+    span = progress_end - progress_start
+    stability_dir = output_dir / "estabilidad" / campaign_type
+    environments_dir = output_dir / "ambientes" / campaign_type
+    _notify(progress, f"{lot.name}: estabilidad de {campaign_type}", progress_start)
+    stability = calculate_stability(
+        imagery,
+        lot.geometry,
+        stability_dir,
+        campaign_type=campaign_type,
+        seasons=options.stability_seasons,
+        max_cloud_percent=options.max_cloud_percent,
+        edge_exclusion_m=options.edge_exclusion_m,
+        cache_arrays=options.cache_review_arrays,
+        excluded_item_ids=excluded_item_ids,
+        progress=lambda completed, total, campaign: _notify(
+            progress,
+            f"{lot.name}: {campaign_type} {completed}/{total} ({campaign})",
+            progress_start + span * 0.75 * completed / total,
+        ),
+    )
+    _write_json(stability_dir / "campanas_utilizadas.json", stability.seasons)
+    write_stability_csv(stability_dir / "estadisticas.csv", stability)
+    if excluded_item_ids is not None:
+        _write_json(
+            stability_dir / "revision_humana.json",
+            {
+                "status": "reviewed",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "campaign_type": campaign_type,
+                "excluded_item_ids": sorted(excluded_item_ids),
+            },
+        )
+    _notify(progress, f"{lot.name}: ambientes de {campaign_type}", progress_start + span * 0.8)
+    alternatives = build_zone_alternatives(stability, environments_dir, options.zone_counts)
+    geopackage = write_geopackage(
+        output_dir / "gis" / f"{safe_slug(lot.name)}_{campaign_type}.gpkg",
+        lot,
+        stability,
+        alternatives,
+        campaign_type,
+    )
+    recommendation = recommended_zone_count(alternatives)
+    metadata_path = _write_json(
+        environments_dir / "alternativas.json",
+        {
+            "campaign_type": campaign_type,
+            "method": "KMeans",
+            "membership": "hard",
+            "features": [
+                {"name": "productividad_media_relativa", "weight": 1.0},
+                {"name": "variabilidad_temporal", "weight": 1.0},
+            ],
+            "preprocessing": "StandardScaler",
+            "minimum_zone_share_percent": 10,
+            "minimum_silhouette": 0.25,
+            "edge_training_exclusion_m": stability.edge_exclusion_m,
+            "excluded_item_ids": sorted(excluded_item_ids or set()),
+            "recommended_k": recommendation,
+            "alternatives": [
+                {
+                    "k": item.k,
+                    "silhouette": round(item.silhouette, 4),
+                    "zone_percentages": item.zone_percentages,
+                    "passes_minimum_zone_share": min(item.zone_percentages.values()) >= 10,
+                }
+                for item in alternatives
+            ],
+        },
+    )
+    return [
+        *stability.artifacts,
+        stability_dir / "campanas_utilizadas.json",
+        stability_dir / "estadisticas.csv",
+        geopackage,
+        metadata_path,
+        *(item.raster_path for item in alternatives),
+    ]
 
 
 def _copy_qgis_assets(output_dir: Path) -> None:
@@ -313,7 +394,11 @@ def _zip_lot(output_dir: Path) -> Path:
         package, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
     ) as archive:
         for path in sorted(output_dir.rglob("*")):
-            if path.is_file() and path.name != ".completed.json":
+            if (
+                path.is_file()
+                and path.name != ".completed.json"
+                and ".cache_escenas" not in path.parts
+            ):
                 archive.write(path, path.relative_to(output_dir.parent))
     return package
 
