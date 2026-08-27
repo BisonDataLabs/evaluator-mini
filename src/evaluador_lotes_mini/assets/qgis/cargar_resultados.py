@@ -1,5 +1,6 @@
 """Ejecutar desde la consola Python de QGIS con exec(open(ruta).read())."""
 
+import re
 from pathlib import Path
 
 from osgeo import ogr
@@ -65,10 +66,35 @@ for geopackage in sorted((BASE / "gis").glob("*.gpkg")):
             )
         PROJECT.addMapLayer(layer)
 
-for raster in BASE.rglob("*.tif"):
+PRODUCT_ORDER = {"NDVI": 0, "IR": 1, "RGB": 2}
+
+
+def representative_sort_key(path):
+    match = re.match(r"(\d{4}-\d{2}-\d{2})_(NDVI|IR|RGB)-", path.stem)
+    if not match:
+        return (0, 99, path.stem)
+    date_value, product = match.groups()
+    return (-int(date_value.replace("-", "")), PRODUCT_ORDER[product], path.stem)
+
+
+representative_rasters = sorted(
+    (BASE / "imagenes_cuadrantes").rglob("*.tif"),
+    key=representative_sort_key,
+)
+representative_set = set(representative_rasters)
+analysis_rasters = sorted(path for path in BASE.rglob("*.tif") if path not in representative_set)
+
+# QGIS inserta cada capa nueva arriba. Se recorren en sentido inverso para que la vista
+# final quede ordenada por fecha descendente y, dentro de cada fecha, NDVI–IR–RGB.
+for raster in reversed(analysis_rasters):
     relative = raster.relative_to(BASE)
     display_name = " · ".join(relative.with_suffix("").parts)
     layer = QgsRasterLayer(str(raster), display_name)
+    if layer.isValid():
+        PROJECT.addMapLayer(layer)
+
+for raster in reversed(representative_rasters):
+    layer = QgsRasterLayer(str(raster), raster.stem)
     if layer.isValid():
         PROJECT.addMapLayer(layer)
 

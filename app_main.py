@@ -383,15 +383,20 @@ def _render_result(result: LotResult) -> None:
                     """
                 )
 
-        scene_metadata = sorted(root.glob("imagenes_cuadrantes/*/*/metadata.json"))
+        scene_metadata = list(root.glob("imagenes_cuadrantes/*/*/metadata.json"))
         if scene_metadata:
             st.subheader("Imágenes representativas")
             choices = {}
-            for metadata_path in scene_metadata:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scene_rows = [
+                (metadata_path, json.loads(metadata_path.read_text(encoding="utf-8")))
+                for metadata_path in scene_metadata
+            ]
+            scene_rows.sort(key=lambda item: str(item[1].get("date") or ""), reverse=True)
+            for metadata_path, metadata in scene_rows:
                 label = (
+                    f"{metadata.get('date', '')} · "
                     f"{metadata.get('campaign', '').capitalize()} · "
-                    f"{metadata.get('climate_quadrant', '')} · {metadata.get('date', '')}"
+                    f"{metadata.get('climate_quadrant', '')}"
                 )
                 choices[label] = (metadata_path.parent, metadata)
             scene_values = [item[1] for item in choices.values()]
@@ -419,10 +424,11 @@ def _render_result(result: LotResult) -> None:
             st.caption(
                 f"Nubosidad de escena: {metadata.get('cloud_percent', 0):.2f}% · "
                 f"píxeles válidos: {metadata.get('valid_pixel_percent', 0):.1f}% · "
+                f"área enmascarada: {metadata.get('contaminated_percent', 0):.2f}% · "
                 f"resolución: {metadata.get('resolution_m', 10):.0f} m · "
                 f"buffer: {metadata.get('buffer_m', 0)} m"
             )
-            for column, product in zip(st.columns(3), ["RGB", "IR", "NDVI"], strict=True):
+            for column, product in zip(st.columns(3), ["NDVI", "IR", "RGB"], strict=True):
                 raster = scene_dir / metadata.get("products", {}).get(product, f"{product}.tif")
                 column.image(
                     cached_preview(
@@ -471,6 +477,71 @@ def _render_result(result: LotResult) -> None:
             )
 
 
+def _render_revision_history(
+    root: Path,
+    stability_dir: Path,
+    result: LotResult,
+    branch: str,
+) -> None:
+    history_file = stability_dir / "historial_previews.json"
+    if not history_file.exists():
+        return
+    history = json.loads(history_file.read_text(encoding="utf-8"))
+    if not history:
+        return
+    with st.expander("Comparar con previews anteriores"):
+        ordered = sorted(
+            history,
+            key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),
+            reverse=True,
+        )
+        labels = {
+            (
+                f"{row.get('completed_at', row.get('revision_id', ''))} · "
+                f"{len(row.get('excluded_item_ids', []))} excluidas"
+            ): row
+            for row in ordered
+        }
+        choice = st.selectbox(
+            "Recálculo",
+            list(labels),
+            key=f"revision-history-{result.lot_id}-{branch}",
+        )
+        revision = labels[choice]
+        changed = revision.get("changed_class_pixels_percent")
+        changed_text = f"{changed:.1f}%" if changed is not None else "no disponible"
+        st.caption(
+            f"Duración: {_duration(revision.get('duration_seconds'))} · "
+            f"píxeles de estabilidad que cambiaron de clase: {changed_text}."
+        )
+        before_tab, after_tab = st.tabs(["Antes", "Después"])
+        for tab, stage in ((before_tab, "before"), (after_tab, "after")):
+            with tab:
+                previews = revision.get("previews", {}).get(stage, [])
+                for offset in range(0, len(previews), 3):
+                    row = previews[offset : offset + 3]
+                    for column, preview in zip(st.columns(len(row)), row, strict=True):
+                        path = root / preview["path"]
+                        if path.exists():
+                            column.image(
+                                str(path),
+                                caption=preview.get("layer", path.stem).replace("_", " "),
+                                width="stretch",
+                            )
+
+
+def _scene_can_be_included(row: dict) -> bool:
+    reason = str(row.get("reason") or "")
+    if reason.startswith("Descartada automáticamente") or reason.startswith("error de lectura"):
+        return False
+    if row.get("contaminated_percent") is not None:
+        return (
+            float(row.get("contaminated_percent") or 0) <= 0.5
+            and float(row.get("largest_contaminated_patch_m2") or 0) <= 1_000
+        )
+    return float(row.get("valid_pixel_percent") or 0) >= 25
+
+
 def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) -> None:
     root = result.output_dir
     stability_dir = root / "estabilidad" / branch
@@ -480,14 +551,40 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
     review_file = stability_dir / "revision_humana.json"
     if review_file.exists():
         review = json.loads(review_file.read_text(encoding="utf-8"))
+        completed_at = review.get("completed_at") or review.get("updated_at") or ""
         st.success(
             f"Resultado revisado · {len(review.get('excluded_item_ids', []))} "
-            "escenas excluidas · el ZIP ya contiene el recálculo."
+            f"escenas excluidas · recálculo terminado {completed_at} · "
+            "el ZIP ya contiene el resultado actual."
         )
+        before = review.get("before", {})
+        after = review.get("after", {})
+        if before and after:
+            metrics = st.columns(4)
+            metrics[0].metric(
+                "Campañas utilizadas",
+                after.get("campaign_count", 0),
+                after.get("campaign_count", 0) - before.get("campaign_count", 0),
+            )
+            metrics[1].metric(
+                "Escenas utilizadas",
+                after.get("included_scene_count", 0),
+                after.get("included_scene_count", 0) - before.get("included_scene_count", 0),
+            )
+            changed = review.get("changed_class_pixels_percent")
+            metrics[2].metric(
+                "Clases modificadas",
+                f"{changed:.1f}%" if changed is not None else "n/d",
+            )
+            metrics[3].metric(
+                "Duración del recálculo",
+                _duration(review.get("duration_seconds")),
+            )
     else:
         st.caption(
             "Resultado preliminar listo para descargar. La revisión de escenas es opcional."
         )
+    _render_revision_history(root, stability_dir, result, branch)
     rasters = [stability, *alternatives]
     for offset in range(0, len(rasters), 3):
         row = rasters[offset : offset + 3]
@@ -542,17 +639,21 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
         return
     with st.expander(f"Revisar o excluir imágenes de {branch}"):
         inventory = json.loads(inventory_file.read_text(encoding="utf-8"))
-        campaigns = sorted({str(row["campaign"]) for row in inventory})
+        campaigns = sorted({str(row["campaign"]) for row in inventory}, reverse=True)
         campaign_filter = st.selectbox(
             "Campaña para inspeccionar",
             ["Todas", *campaigns],
             key=f"campaign-filter-{result.lot_id}-{branch}",
         )
-        visible = [
+        visible = sorted(
+            [
             row
             for row in inventory
             if campaign_filter == "Todas" or row["campaign"] == campaign_filter
-        ]
+            ],
+            key=lambda row: str(row.get("date") or ""),
+            reverse=True,
+        )
         review_table = pd.DataFrame(
             [
                 {
@@ -561,6 +662,7 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
                     "fecha": row.get("date"),
                     "nubosidad_%": row.get("cloud_percent"),
                     "píxeles_válidos_%": row.get("valid_pixel_percent"),
+                    "área_enmascarada_%": row.get("contaminated_percent"),
                     "estado": row.get("reason", "incluida"),
                     "item_id": row.get("item_id"),
                 }
@@ -576,6 +678,7 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
                 "fecha",
                 "nubosidad_%",
                 "píxeles_válidos_%",
+                "área_enmascarada_%",
                 "estado",
                 "item_id",
             ],
@@ -590,7 +693,10 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
             key=f"excluded-campaigns-{result.lot_id}-{branch}",
         )
         preview_choices = {
-            f"{row.get('campaign')} · {row.get('date')} · {row.get('item_id')}": row
+            (
+                f"{row.get('date')} · {row.get('campaign')} · "
+                f"{'INCLUIDA' if row.get('included') else 'EXCLUIDA'} · {row.get('item_id')}"
+            ): row
             for row in visible
             if (stability_dir / str(row.get("preview", ""))).exists()
         }
@@ -601,7 +707,11 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
                 key=f"scene-preview-{result.lot_id}-{branch}",
             )
             preview = stability_dir / preview_choices[preview_choice]["preview"]
-            st.image(str(preview), caption=preview_choice, width="stretch")
+            selected_preview = preview_choices[preview_choice]
+            caption = preview_choice
+            if selected_preview.get("reason"):
+                caption += f" · {selected_preview.get('reason')}"
+            st.image(str(preview), caption=caption, width="stretch")
 
         visible_ids = {str(row["item_id"]) for row in visible}
         excluded_ids = {
@@ -621,7 +731,7 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
             str(row["campaign"])
             for row in inventory
             if str(row["item_id"]) not in excluded_ids
-            and float(row.get("valid_pixel_percent") or 0) >= 25
+            and _scene_can_be_included(row)
         }
         insufficient_campaigns = len(remaining_campaigns) < 3
         if insufficient_campaigns:

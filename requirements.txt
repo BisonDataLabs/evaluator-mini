@@ -3,6 +3,7 @@ geopandas>=1.0,<2
 matplotlib>=3.9,<4
 numpy>=2.0,<3
 pandas>=2.2,<3
+pillow>=10,<13
 planetary-computer>=1.0,<2
 plotly>=6.0,<7
 pyogrio>=0.10,<1

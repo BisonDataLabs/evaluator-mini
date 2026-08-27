@@ -20,7 +20,11 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
 from evaluador_lotes_mini.imagery.grid import RasterGrid, grid_for_geometry, write_raster
-from evaluador_lotes_mini.imagery.planetary import PlanetaryImagery, read_ndvi_false_color
+from evaluador_lotes_mini.imagery.planetary import (
+    PlanetaryImagery,
+    read_ndvi_false_color,
+    scene_quality,
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -90,7 +94,7 @@ def calculate_stability(
                 float(item.properties.get("eo:cloud_cover", 100)),
                 item.datetime.timestamp() if item.datetime else 0,
             ),
-        )[:scenes_per_season]
+        )[: max(20, scenes_per_season)]
         stack: list[np.ndarray] = []
         used: list[str] = []
         for item in candidates:
@@ -126,13 +130,16 @@ def calculate_stability(
                         )
                 valid_fraction = _valid_fraction(valid, grid.inside_mask)
                 record["valid_pixel_percent"] = round(valid_fraction * 100, 1)
+                quality = scene_quality(valid, grid.inside_mask, grid.resolution)
+                record["contaminated_percent"] = quality["contaminated_percent"]
+                record["largest_contaminated_patch_m2"] = quality["largest_patch_m2"]
                 if not preview_path.exists():
                     if false_color is None:
                         _, _, false_color = read_ndvi_false_color(item, grid)
                     _write_false_color_preview(false_color, preview_path, f"{label} · {acquired}")
-                if valid_fraction < 0.25:
+                if not quality["passes"]:
                     record["included"] = False
-                    record["reason"] = "menos de 25% de píxeles válidos"
+                    record["reason"] = quality["reason"]
                 elif item.id in excluded:
                     record["reason"] = "excluida por el usuario"
                 else:
@@ -142,6 +149,8 @@ def calculate_stability(
                 record["included"] = False
                 record["reason"] = f"error de lectura: {exc}"
             scene_inventory.append(record)
+            if len(used) >= scenes_per_season:
+                break
 
         if stack:
             with warnings.catch_warnings(), np.errstate(all="ignore"):

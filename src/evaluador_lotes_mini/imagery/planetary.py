@@ -28,6 +28,8 @@ from evaluador_lotes_mini.imagery.grid import (
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 S2_COLLECTION = "sentinel-2-l2a"
 CLEAR_SCL = {4, 5, 6, 11}
+MAX_CLIP_CONTAMINATION_PERCENT = 0.5
+MAX_CONTAMINATED_PATCH_M2 = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,8 @@ class SelectedScene:
     cloud_percent: float | None
     coverage_percent: float
     collection: str
+    contaminated_percent: float
+    largest_contaminated_patch_m2: float
 
 
 class PlanetaryImagery:
@@ -75,6 +79,7 @@ class PlanetaryImagery:
         end: date,
         max_cloud_percent: float = 30,
         candidates: int = 6,
+        buffer_m: int = 500,
     ) -> tuple[Item, SelectedScene]:
         items = self.search_sentinel(geometry, start, end, max_cloud_percent)
         if not items:
@@ -85,19 +90,33 @@ class PlanetaryImagery:
                 float(item.properties.get("eo:cloud_cover", 100)),
                 -_coverage(item, geometry),
             ),
-        )[:candidates]
+        )
         grid = grid_for_geometry(geometry, resolution=30)
+        quality_grid = grid_for_geometry(buffered_wgs84(geometry, buffer_m), resolution=20)
         scored: list[tuple[float, float, Item]] = []
+        quality_by_item: dict[str, dict[str, Any]] = {}
         for item in ranked:
             try:
+                quality = read_scene_quality(item, quality_grid)
+                quality_by_item[item.id] = quality
+                if not quality["passes"]:
+                    continue
                 ndvi, valid = _read_ndvi(item, grid)
                 values = ndvi[valid & np.isfinite(ndvi)]
                 valid_fraction = _valid_fraction(valid, grid.inside_mask)
                 if values.size and valid_fraction >= 0.25:
                     scored.append((float(np.mean(values)), valid_fraction, item))
+                    if len(scored) >= candidates:
+                        break
             except Exception:
                 continue
-        selected = max(scored, key=lambda pair: (pair[0], pair[1]))[2] if scored else ranked[0]
+        if not scored:
+            raise RuntimeError(
+                "No se encontró una escena sin nubes, sombras o huecos relevantes "
+                "dentro del lote y su buffer"
+            )
+        selected = max(scored, key=lambda pair: (pair[0], pair[1]))[2]
+        quality = quality_by_item[selected.id]
         metadata = SelectedScene(
             item_id=selected.id,
             acquisition_date=(
@@ -106,6 +125,8 @@ class PlanetaryImagery:
             cloud_percent=_float_or_none(selected.properties.get("eo:cloud_cover")),
             coverage_percent=round(_coverage(selected, geometry) * 100, 1),
             collection=S2_COLLECTION,
+            contaminated_percent=quality["contaminated_percent"],
+            largest_contaminated_patch_m2=quality["largest_patch_m2"],
         )
         return selected, metadata
 
@@ -116,8 +137,13 @@ class PlanetaryImagery:
         output_dir: Path,
         buffer_m: int = 500,
         file_prefix: str | None = None,
+        file_suffix: str | None = None,
     ) -> tuple[list[Path], dict[str, Any]]:
         context = buffered_wgs84(lot_geometry, buffer_m)
+        quality_grid = grid_for_geometry(context, resolution=20)
+        quality = read_scene_quality(item, quality_grid)
+        if not quality["passes"]:
+            raise RuntimeError(str(quality["reason"]))
         grid = grid_for_geometry(context)
         blue = read_asset(item.assets["B02"].href, grid)
         green = read_asset(item.assets["B03"].href, grid)
@@ -138,9 +164,11 @@ class PlanetaryImagery:
         good = valid & (denominator != 0)
         ndvi[good] = (nir[good] - red[good]) / denominator[good]
 
-        prefix = f"{file_prefix}_" if file_prefix else ""
+        def product_name(product: str) -> str:
+            return _product_filename(product, file_prefix, file_suffix)
+
         rgb_path = write_raster(
-            output_dir / f"{prefix}RGB.tif",
+            output_dir / product_name("RGB"),
             [red, green, blue],
             grid,
             dtype="uint16",
@@ -148,7 +176,7 @@ class PlanetaryImagery:
             descriptions=["Red", "Green", "Blue"],
         )
         ir_path = write_raster(
-            output_dir / f"{prefix}IR.tif",
+            output_dir / product_name("IR"),
             [nir, red, green],
             grid,
             dtype="uint16",
@@ -156,7 +184,7 @@ class PlanetaryImagery:
             descriptions=["NIR", "Red", "Green"],
         )
         ndvi_path = write_raster(
-            output_dir / f"{prefix}NDVI.tif",
+            output_dir / product_name("NDVI"),
             ndvi,
             grid,
             dtype="float32",
@@ -171,6 +199,9 @@ class PlanetaryImagery:
             "resolution_m": grid.resolution,
             "crs": grid.crs.to_string(),
             "valid_pixel_percent": round(_valid_fraction(valid, grid.inside_mask) * 100, 1),
+            "contaminated_percent": quality["contaminated_percent"],
+            "largest_contaminated_patch_m2": quality["largest_patch_m2"],
+            "quality_status": "aprobada",
             "products": {
                 "RGB": rgb_path.name,
                 "IR": ir_path.name,
@@ -201,6 +232,8 @@ def scene_metadata(item: Item, geometry: BaseGeometry) -> dict[str, Any]:
             cloud_percent=_float_or_none(item.properties.get("eo:cloud_cover")),
             coverage_percent=round(_coverage(item, geometry) * 100, 1),
             collection=S2_COLLECTION,
+            contaminated_percent=0.0,
+            largest_contaminated_patch_m2=0.0,
         )
     )
 
@@ -248,6 +281,67 @@ def read_ndvi_false_color(
     return ndvi, valid, false_color
 
 
+def read_scene_quality(item: Item, grid: RasterGrid) -> dict[str, Any]:
+    """Measure holes/cloud masks inside a clip and apply the APB acceptance rule."""
+    scl = read_asset(
+        item.assets["SCL"].href,
+        grid,
+        resampling=Resampling.nearest,
+        dtype="uint8",
+        nodata=0,
+    )
+    clear = np.isin(scl, list(CLEAR_SCL)) & grid.inside_mask
+    return scene_quality(clear, grid.inside_mask, grid.resolution)
+
+
+def scene_quality(
+    clear: np.ndarray,
+    footprint: np.ndarray,
+    resolution_m: float,
+    *,
+    max_contamination_percent: float = MAX_CLIP_CONTAMINATION_PERCENT,
+    max_patch_area_m2: float = MAX_CONTAMINATED_PATCH_M2,
+) -> dict[str, Any]:
+    """Classify clip contamination, excluding pixels outside the requested footprint."""
+    from scipy.ndimage import label
+
+    contaminated = footprint & ~clear
+    denominator = int(np.count_nonzero(footprint))
+    contaminated_pixels = int(np.count_nonzero(contaminated))
+    contaminated_percent = contaminated_pixels / denominator * 100 if denominator else 100.0
+    components, count = label(contaminated, structure=np.ones((3, 3), dtype="uint8"))
+    largest_pixels = 0
+    if count:
+        sizes = np.bincount(components.ravel())
+        largest_pixels = int(sizes[1:].max(initial=0))
+    largest_patch_m2 = largest_pixels * resolution_m**2
+    passes = (
+        contaminated_percent <= max_contamination_percent
+        and largest_patch_m2 <= max_patch_area_m2
+    )
+    reasons = []
+    if contaminated_percent > max_contamination_percent:
+        reasons.append(
+            f"{contaminated_percent:.2f}% del clip está enmascarado "
+            f"(máximo {max_contamination_percent:.2f}%)"
+        )
+    if largest_patch_m2 > max_patch_area_m2:
+        reasons.append(
+            f"parche continuo de {largest_patch_m2 / 10_000:.2f} ha "
+            f"(máximo {max_patch_area_m2 / 10_000:.2f} ha)"
+        )
+    return {
+        "passes": passes,
+        "contaminated_percent": round(contaminated_percent, 3),
+        "largest_patch_m2": round(largest_patch_m2, 1),
+        "reason": (
+            "Escena aprobada"
+            if passes
+            else "Descartada automáticamente: " + "; ".join(reasons)
+        ),
+    }
+
+
 def _coverage(item: Item, geometry: BaseGeometry) -> float:
     if not item.geometry:
         return 0.0
@@ -282,3 +376,10 @@ def _tile_from_item_id(item_id: str) -> str:
 def _valid_fraction(valid: np.ndarray, footprint: np.ndarray) -> float:
     denominator = int(np.count_nonzero(footprint))
     return float(np.count_nonzero(valid & footprint) / denominator) if denominator else 0.0
+
+
+def _product_filename(product: str, prefix: str | None, suffix: str | None) -> str:
+    if prefix and suffix:
+        return f"{prefix}_{product}-{suffix}.tif"
+    prefix_text = f"{prefix}_" if prefix else ""
+    return f"{prefix_text}{product}.tif"

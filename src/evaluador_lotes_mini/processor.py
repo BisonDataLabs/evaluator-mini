@@ -14,6 +14,10 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+import numpy as np
+import rasterio
+from PIL import Image
+
 from evaluador_lotes_mini.analysis.stability import CampaignType, calculate_stability
 from evaluador_lotes_mini.analysis.zoning import (
     build_zone_alternatives,
@@ -40,6 +44,7 @@ from evaluador_lotes_mini.outputs.gis import (
     write_rows_csv,
     write_stability_csv,
 )
+from evaluador_lotes_mini.ui_preview import render_raster
 
 ProgressCallback = Callable[[str, float], None]
 
@@ -164,15 +169,15 @@ def process_lot(
                         start,
                         end,
                         max_cloud_percent=options.max_cloud_percent,
+                        buffer_m=options.buffer_m,
                     )
                     artifacts, metadata = imagery.export_scene_products(
                         item,
                         lot.geometry,
                         scene_dir,
                         buffer_m=options.buffer_m,
-                        file_prefix=(
-                            f"{campaign}_{safe_slug(quadrant)}_{selection.acquisition_date}"
-                        ),
+                        file_prefix=selection.acquisition_date,
+                        file_suffix=f"{campaign}_{_qgis_quadrant_token(quadrant)}",
                     )
                     metadata.update(
                         {
@@ -230,6 +235,14 @@ def recalculate_productivity_campaign(
     progress: ProgressCallback | None = None,
 ) -> Path:
     """Rebuild one productivity branch from cached scenes after human review."""
+    started = monotonic()
+    started_at = datetime.now(UTC)
+    revision_id = started_at.strftime("%Y%m%dT%H%M%SZ")
+    before = _productivity_summary(output_dir, campaign_type)
+    previous_classes = _read_classes(output_dir, campaign_type)
+    before_previews = _snapshot_productivity_previews(
+        output_dir, campaign_type, revision_id, "antes"
+    )
     imagery = PlanetaryImagery()
     _process_productivity_campaign(
         lot,
@@ -241,6 +254,35 @@ def recalculate_productivity_campaign(
         progress=progress,
         progress_start=0.0,
         progress_end=1.0,
+    )
+    after = _productivity_summary(output_dir, campaign_type)
+    current_classes = _read_classes(output_dir, campaign_type)
+    after_previews = _snapshot_productivity_previews(
+        output_dir, campaign_type, revision_id, "despues"
+    )
+    completed_at = datetime.now(UTC)
+    entry = {
+        "revision_id": revision_id,
+        "status": "completed",
+        "campaign_type": campaign_type,
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "duration_seconds": round(monotonic() - started, 1),
+        "excluded_item_ids": sorted(excluded_item_ids),
+        "before": before,
+        "after": after,
+        "changed_class_pixels_percent": _changed_class_percent(
+            previous_classes, current_classes
+        ),
+        "previews": {"before": before_previews, "after": after_previews},
+    }
+    history_file = output_dir / "estabilidad" / campaign_type / "historial_previews.json"
+    history = _read_json_list(history_file)
+    history.append(entry)
+    _write_json(history_file, history)
+    _write_json(
+        output_dir / "estabilidad" / campaign_type / "revision_humana.json",
+        {**entry, "history_count": len(history)},
     )
     return _zip_lot(output_dir)
 
@@ -279,16 +321,6 @@ def _process_productivity_campaign(
     )
     _write_json(stability_dir / "campanas_utilizadas.json", stability.seasons)
     write_stability_csv(stability_dir / "estadisticas.csv", stability)
-    if excluded_item_ids is not None:
-        _write_json(
-            stability_dir / "revision_humana.json",
-            {
-                "status": "reviewed",
-                "updated_at": datetime.now(UTC).isoformat(),
-                "campaign_type": campaign_type,
-                "excluded_item_ids": sorted(excluded_item_ids),
-            },
-        )
     _notify(progress, f"{lot.name}: ambientes de {campaign_type}", progress_start + span * 0.8)
     alternatives = build_zone_alternatives(stability, environments_dir, options.zone_counts)
     geopackage = write_geopackage(
@@ -347,6 +379,75 @@ def _copy_qgis_assets(output_dir: Path) -> None:
         )
 
 
+def _productivity_summary(output_dir: Path, campaign_type: CampaignType) -> dict[str, Any]:
+    stability_dir = output_dir / "estabilidad" / campaign_type
+    seasons_file = stability_dir / "campanas_utilizadas.json"
+    scenes_file = stability_dir / "escenas_utilizadas.json"
+    seasons = json.loads(seasons_file.read_text(encoding="utf-8")) if seasons_file.exists() else []
+    scenes = json.loads(scenes_file.read_text(encoding="utf-8")) if scenes_file.exists() else []
+    return {
+        "campaign_count": len(seasons),
+        "campaigns": [row.get("campaign") for row in seasons],
+        "included_scene_count": sum(bool(row.get("included")) for row in scenes),
+        "inventory_scene_count": len(scenes),
+    }
+
+
+def _read_classes(output_dir: Path, campaign_type: CampaignType) -> np.ndarray | None:
+    path = output_dir / "estabilidad" / campaign_type / "estabilidad_5_clases.tif"
+    if not path.exists():
+        return None
+    with rasterio.open(path) as source:
+        return source.read(1)
+
+
+def _changed_class_percent(before: np.ndarray | None, after: np.ndarray | None) -> float | None:
+    if before is None or after is None or before.shape != after.shape:
+        return None
+    comparable = (before > 0) & (after > 0)
+    total = int(np.count_nonzero(comparable))
+    if not total:
+        return None
+    return round(float(np.count_nonzero(before[comparable] != after[comparable]) / total * 100), 1)
+
+
+def _snapshot_productivity_previews(
+    output_dir: Path,
+    campaign_type: CampaignType,
+    revision_id: str,
+    stage: str,
+) -> list[dict[str, str]]:
+    stability_dir = output_dir / "estabilidad" / campaign_type
+    environment_dir = output_dir / "ambientes" / campaign_type
+    boundary = output_dir / "entrada" / "lote.geojson"
+    rasters = [
+        stability_dir / "estabilidad_5_clases.tif",
+        *sorted(environment_dir.glob("ambientes_k*.tif")),
+    ]
+    target_dir = stability_dir / "historial_previews" / revision_id / stage
+    rows: list[dict[str, str]] = []
+    for raster in rasters:
+        if not raster.exists():
+            continue
+        target = target_dir / f"{raster.stem}.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(render_raster(raster, boundary)).save(target, format="PNG", optimize=True)
+        rows.append(
+            {
+                "layer": raster.stem,
+                "path": str(target.relative_to(output_dir)),
+            }
+        )
+    return rows
+
+
+def _read_json_list(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, list) else []
+
+
 def _write_report(
     output_dir: Path,
     lot: Lot,
@@ -398,6 +499,7 @@ def _zip_lot(output_dir: Path) -> Path:
                 path.is_file()
                 and path.name != ".completed.json"
                 and ".cache_escenas" not in path.parts
+                and not (path.parent.name == "qgis" and path.name == "LEEME.txt")
             ):
                 archive.write(path, path.relative_to(output_dir.parent))
     return package
@@ -430,3 +532,7 @@ def _write_json(path: Path, value: Any) -> Path:
 def _notify(callback: ProgressCallback | None, message: str, fraction: float) -> None:
     if callback:
         callback(message, max(0.0, min(1.0, fraction)))
+
+
+def _qgis_quadrant_token(value: str) -> str:
+    return safe_slug(value).replace("-", "_").capitalize()
