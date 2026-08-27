@@ -482,6 +482,8 @@ def _render_revision_history(
     stability_dir: Path,
     result: LotResult,
     branch: str,
+    *,
+    expanded: bool = False,
 ) -> None:
     history_file = stability_dir / "historial_previews.json"
     if not history_file.exists():
@@ -489,7 +491,7 @@ def _render_revision_history(
     history = json.loads(history_file.read_text(encoding="utf-8"))
     if not history:
         return
-    with st.expander("Comparar con previews anteriores"):
+    with st.expander("Comparar con previews anteriores", expanded=expanded):
         ordered = sorted(
             history,
             key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),
@@ -549,6 +551,8 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
     stability = stability_dir / "estabilidad_5_clases.tif"
     alternatives = sorted(environments_dir.glob("ambientes_k*.tif"))
     review_file = stability_dir / "revision_humana.json"
+    completion_key = f"recalculation-completed-{result.lot_id}-{branch}"
+    just_recalculated = bool(st.session_state.pop(completion_key, False))
     if review_file.exists():
         review = json.loads(review_file.read_text(encoding="utf-8"))
         completed_at = review.get("completed_at") or review.get("updated_at") or ""
@@ -584,7 +588,13 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
         st.caption(
             "Resultado preliminar listo para descargar. La revisión de escenas es opcional."
         )
-    _render_revision_history(root, stability_dir, result, branch)
+    _render_revision_history(
+        root,
+        stability_dir,
+        result,
+        branch,
+        expanded=just_recalculated,
+    )
     rasters = [stability, *alternatives]
     for offset in range(0, len(rasters), 3):
         row = rasters[offset : offset + 3]
@@ -692,17 +702,24 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
             campaigns,
             key=f"excluded-campaigns-{result.lot_id}-{branch}",
         )
+        # The false-colour browser always spans the complete inventory. The campaign
+        # filter above is intentionally limited to the editable review table.
+        preview_inventory = sorted(
+            inventory,
+            key=lambda row: str(row.get("date") or ""),
+            reverse=True,
+        )
         preview_choices = {
             (
                 f"{row.get('date')} · {row.get('campaign')} · "
                 f"{'INCLUIDA' if row.get('included') else 'EXCLUIDA'} · {row.get('item_id')}"
             ): row
-            for row in visible
+            for row in preview_inventory
             if (stability_dir / str(row.get("preview", ""))).exists()
         }
         if preview_choices:
             preview_choice = st.selectbox(
-                "Vista falso color",
+                "Vista falso color · todas las campañas",
                 list(preview_choices),
                 key=f"scene-preview-{result.lot_id}-{branch}",
             )
@@ -774,7 +791,7 @@ def _render_productivity_branch(result: LotResult, branch: str, boundary: Path) 
                 st.error(f"No se pudo recalcular {branch}: {exc}")
                 return
             cached_preview.clear()
-            st.success(f"Se recalculó {branch} y se actualizó el ZIP del lote.")
+            st.session_state[completion_key] = True
             st.rerun()
 
 
