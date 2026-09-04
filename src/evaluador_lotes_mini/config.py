@@ -13,7 +13,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CEIBOS_ROOT = PROJECT_ROOT.parent
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +48,9 @@ def _path_from_env(name: str, default: Path) -> Path:
 
 def load_settings() -> Settings:
     load_dotenv(PROJECT_ROOT / ".env", override=False)
-    default_key = CEIBOS_ROOT / "Generales/credenciales/snowflake/rsa_key_lnieto_analytics.p8"
     key_raw = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
-    key_path = Path(key_raw).expanduser() if key_raw else default_key
-    if not key_path.exists():
+    key_path = Path(key_raw).expanduser() if key_raw else None
+    if key_path is not None and not key_path.exists():
         key_path = None
 
     settings = Settings(
@@ -62,17 +60,17 @@ def load_settings() -> Settings:
         output_dir=_path_from_env("ELM_OUTPUT_DIR", PROJECT_ROOT / "outputs"),
         max_workers=max(1, min(8, int(os.getenv("ELM_MAX_WORKERS", "2")))),
         default_buffer_m=max(0, int(os.getenv("ELM_DEFAULT_BUFFER_M", "500"))),
-        snowflake_account=os.getenv("SNOWFLAKE_ACCOUNT", "IQTGLEW-CEIBOS"),
-        snowflake_user=os.getenv("SNOWFLAKE_USER", "LNIETO_CEIBOS"),
-        snowflake_role=os.getenv("SNOWFLAKE_ROLE", "CEIBOS_READ_ONLY_ROLE"),
-        snowflake_warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-        snowflake_database=os.getenv("SNOWFLAKE_DATABASE", "PROCESSED"),
-        snowflake_schema=os.getenv("SNOWFLAKE_SCHEMA", "DBT_MARIANA"),
+        snowflake_account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        snowflake_user=os.getenv("SNOWFLAKE_USER"),
+        snowflake_role=os.getenv("SNOWFLAKE_ROLE", ""),
+        snowflake_warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", ""),
+        snowflake_database=os.getenv("SNOWFLAKE_DATABASE", ""),
+        snowflake_schema=os.getenv("SNOWFLAKE_SCHEMA", ""),
         snowflake_private_key_path=key_path,
         snowflake_private_key_pem=os.getenv("SNOWFLAKE_PRIVATE_KEY_PEM"),
         snowflake_private_key_b64=os.getenv("SNOWFLAKE_PRIVATE_KEY_B64"),
         snowflake_private_key_passphrase=os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"),
-        legacy_snowflake_connector=(CEIBOS_ROOT / "Generales/credenciales/snowflake/conexion.py"),
+        legacy_snowflake_connector=Path("__disabled_in_public_upload__"),
     )
     settings.ensure_directories()
     return settings

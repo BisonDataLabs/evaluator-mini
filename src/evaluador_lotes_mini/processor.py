@@ -26,6 +26,7 @@ from evaluador_lotes_mini.analysis.zoning import (
 from evaluador_lotes_mini.climate.nasa_power import (
     analyze_climate,
     fetch_monthly_climate,
+    ranked_representative_years,
     representative_years,
     serialize_monthly,
 )
@@ -117,10 +118,15 @@ def process_lot(
         monthly = fetch_monthly_climate(lot.geometry, options.start_year, options.end_year)
         climate = analyze_climate(monthly, options.start_year, options.end_year)
         representatives = representative_years(climate)
+        representative_candidates = ranked_representative_years(climate)
         climate_dir = output_dir / "clima"
         _write_json(climate_dir / "clima_mensual.json", serialize_monthly(monthly))
         _write_json(climate_dir / "analisis_climatico.json", climate)
         _write_json(climate_dir / "anos_representativos.json", representatives)
+        _write_json(
+            climate_dir / "anos_representativos_candidatos.json",
+            representative_candidates,
+        )
         write_rows_csv(climate_dir / "clima_mensual.csv", serialize_monthly(monthly))
         chart_artifacts = write_climate_charts(climate_dir, climate)
         result.artifacts.extend(
@@ -128,6 +134,7 @@ def process_lot(
                 climate_dir / "clima_mensual.csv",
                 climate_dir / "analisis_climatico.json",
                 climate_dir / "anos_representativos.json",
+                climate_dir / "anos_representativos_candidatos.json",
                 *chart_artifacts,
             ]
         )
@@ -147,11 +154,14 @@ def process_lot(
                         f"Sin año Sentinel-2 representativo para {campaign}/{missing}"
                     )
             selections = [
-                (campaign, quadrant, year)
-                for campaign, quadrants in representatives.items()
-                for quadrant, year in quadrants.items()
+                (campaign, quadrant, candidate_years[:3])
+                for campaign, quadrants in representative_candidates.items()
+                for quadrant, candidate_years in quadrants.items()
+                if candidate_years
             ]
-            for position, (campaign, quadrant, year) in enumerate(selections, start=1):
+            for position, (campaign, quadrant, candidate_years) in enumerate(
+                selections, start=1
+            ):
                 _notify(
                     progress,
                     f"{lot.name}: imagen {position}/{len(selections)} ({campaign}, {quadrant})",
@@ -163,34 +173,18 @@ def process_lot(
                     scene_manifest.append(json.loads(metadata_path.read_text(encoding="utf-8")))
                     continue
                 try:
-                    start, end = campaign_dates(campaign, int(year))
-                    item, selection = imagery.select_peak_scene(
-                        lot.geometry,
-                        start,
-                        end,
-                        max_cloud_percent=options.max_cloud_percent,
-                        buffer_m=options.buffer_m,
-                    )
-                    artifacts, metadata = imagery.export_scene_products(
-                        item,
-                        lot.geometry,
+                    artifacts, metadata = _export_first_valid_representative(
+                        imagery,
+                        lot,
+                        options,
+                        campaign,
+                        quadrant,
+                        candidate_years,
                         scene_dir,
-                        buffer_m=options.buffer_m,
-                        file_prefix=selection.acquisition_date,
-                        file_suffix=f"{campaign}_{_qgis_quadrant_token(quadrant)}",
                     )
-                    metadata.update(
-                        {
-                            "campaign": campaign,
-                            "climate_quadrant": quadrant,
-                            "representative_year": year,
-                            "selection": asdict(selection),
-                        }
-                    )
-                    _write_json(metadata_path, metadata)
                     result.artifacts.extend(artifacts)
                     scene_manifest.append(metadata)
-                except Exception as exc:
+                except RuntimeError as exc:
                     result.warnings.append(f"Imagen {campaign}/{quadrant}: {exc}")
         _write_json(output_dir / "imagenes_cuadrantes" / "manifest.json", scene_manifest)
 
@@ -223,6 +217,59 @@ def process_lot(
     if result.status == "completed":
         _write_json(done_file, result.manifest_dict())
     return result
+
+
+def _export_first_valid_representative(
+    imagery: PlanetaryImagery,
+    lot: Lot,
+    options: ProcessingOptions,
+    campaign: str,
+    quadrant: str,
+    candidate_years: list[int],
+    scene_dir: Path,
+) -> tuple[list[Path], dict[str, Any]]:
+    """Try ranked years in order and export the first scene that passes unchanged QA."""
+    attempt_errors: list[str] = []
+    for rank, year in enumerate(candidate_years, start=1):
+        try:
+            start, end = campaign_dates(campaign, int(year))
+            item, selection = imagery.select_peak_scene(
+                lot.geometry,
+                start,
+                end,
+                max_cloud_percent=options.max_cloud_percent,
+                buffer_m=options.buffer_m,
+            )
+            artifacts, metadata = imagery.export_scene_products(
+                item,
+                lot.geometry,
+                scene_dir,
+                buffer_m=options.buffer_m,
+                file_prefix=selection.acquisition_date,
+                file_suffix=f"{campaign}_{_qgis_quadrant_token(quadrant)}",
+            )
+            metadata.update(
+                {
+                    "campaign": campaign,
+                    "climate_quadrant": quadrant,
+                    "representative_year": year,
+                    "primary_representative_year": candidate_years[0],
+                    "representative_rank": rank,
+                    "representative_candidates_tried": candidate_years[:rank],
+                    "selection": asdict(selection),
+                }
+            )
+            _write_json(scene_dir / "metadata.json", metadata)
+            return artifacts, metadata
+        except Exception as exc:
+            attempt_errors.append(f"{year}: {exc}")
+
+    attempted = ", ".join(str(year) for year in candidate_years)
+    last_error = attempt_errors[-1] if attempt_errors else "sin candidatos"
+    raise RuntimeError(
+        f"no hubo escena válida en los años representativos probados ({attempted}). "
+        f"Último intento: {last_error}"
+    )
 
 
 def recalculate_productivity_campaign(

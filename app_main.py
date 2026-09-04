@@ -333,8 +333,22 @@ def _render_result(result: LotResult) -> None:
             return
         root = result.output_dir
         boundary = root / "entrada" / "lote.geojson"
-        if result.warnings:
-            st.warning("\n".join(result.warnings))
+        image_warnings = [
+            warning
+            for warning in result.warnings
+            if warning.startswith("Imagen ")
+            or warning.startswith("Sin año Sentinel-2 representativo")
+        ]
+        general_warnings = [
+            warning for warning in result.warnings if warning not in image_warnings
+        ]
+        if general_warnings:
+            st.warning("\n".join(general_warnings))
+        stability_branches = [
+            branch
+            for branch in ("gruesa", "fina")
+            if (root / "estabilidad" / branch / "estabilidad_5_clases.tif").exists()
+        ]
 
         st.subheader("Clima")
         climate_file = root / "clima" / "analisis_climatico.json"
@@ -384,8 +398,20 @@ def _render_result(result: LotResult) -> None:
                 )
 
         scene_metadata = list(root.glob("imagenes_cuadrantes/*/*/metadata.json"))
-        if scene_metadata:
+        if scene_metadata or image_warnings:
             st.subheader("Imágenes representativas")
+        if image_warnings:
+            if stability_branches:
+                st.info(
+                    "Estas advertencias corresponden solamente a las imágenes "
+                    "representativas por cuadrante. El clima, la estabilidad y los "
+                    "ambientes se calcularon y se muestran más abajo."
+                )
+            with st.expander(
+                f"Ver {len(image_warnings)} imágenes representativas no generadas"
+            ):
+                st.warning("\n".join(f"• {warning}" for warning in image_warnings))
+        if scene_metadata:
             choices = {}
             scene_rows = [
                 (metadata_path, json.loads(metadata_path.read_text(encoding="utf-8")))
@@ -413,7 +439,7 @@ def _render_result(result: LotResult) -> None:
             if len(scene_values) < 8:
                 st.caption(
                     f"Se generaron {len(scene_values)} de hasta 8 combinaciones. "
-                    "Solo se muestran cuadrantes con un año Sentinel-2 representativo disponible."
+                    "Las combinaciones faltantes y sus motivos se detallan arriba."
                 )
             selection = st.selectbox(
                 "Campaña y cuadrante",
@@ -421,6 +447,13 @@ def _render_result(result: LotResult) -> None:
                 key=f"scene-{result.lot_id}",
             )
             scene_dir, metadata = choices[selection]
+            representative_rank = int(metadata.get("representative_rank") or 1)
+            if representative_rank > 1:
+                st.caption(
+                    f"Se utilizó la alternativa climática #{representative_rank}: "
+                    f"el año principal {metadata.get('primary_representative_year')} "
+                    "no tenía una escena que cumpliera el control de calidad."
+                )
             st.caption(
                 f"Nubosidad de escena: {metadata.get('cloud_percent', 0):.2f}% · "
                 f"píxeles válidos: {metadata.get('valid_pixel_percent', 0):.1f}% · "
@@ -438,11 +471,6 @@ def _render_result(result: LotResult) -> None:
                     width="stretch",
                 )
 
-        stability_branches = [
-            branch
-            for branch in ("gruesa", "fina")
-            if (root / "estabilidad" / branch / "estabilidad_5_clases.tif").exists()
-        ]
         if stability_branches:
             st.subheader("Estabilidad y ambientes productivos")
             with st.expander("Cómo se calcularon estas capas"):

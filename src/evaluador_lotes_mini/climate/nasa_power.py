@@ -119,8 +119,11 @@ def analyze_climate(
     }
 
 
-def representative_years(climate: dict[str, Any], minimum_satellite_year: int = 2017) -> dict:
-    result: dict[str, dict[str, int]] = {"gruesa": {}, "fina": {}}
+def ranked_representative_years(
+    climate: dict[str, Any], minimum_satellite_year: int = 2017
+) -> dict[str, dict[str, list[int]]]:
+    """Rank usable years in each quadrant by standardized distance to its centroid."""
+    result: dict[str, dict[str, list[int]]] = {"gruesa": {}, "fina": {}}
     for campaign_name, campaign in climate["campaigns"].items():
         all_years = campaign["years"]
         if not all_years:
@@ -134,7 +137,7 @@ def representative_years(climate: dict[str, Any], minimum_satellite_year: int = 
             if pool:
                 target_t = summary["average_temperature_c"]
                 target_p = summary["average_precipitation_mm"]
-                selected = min(
+                ranked = sorted(
                     pool,
                     key=lambda row: (
                         ((row["temperature_c"] - target_t) / temperature_scale) ** 2
@@ -142,8 +145,21 @@ def representative_years(climate: dict[str, Any], minimum_satellite_year: int = 
                         -row["year"],
                     ),
                 )
-                result[campaign_name][quadrant] = int(selected["year"])
+                result[campaign_name][quadrant] = [int(row["year"]) for row in ranked]
     return result
+
+
+def representative_years(climate: dict[str, Any], minimum_satellite_year: int = 2017) -> dict:
+    """Return the first-ranked representative year for backwards-compatible exports."""
+    ranked = ranked_representative_years(climate, minimum_satellite_year)
+    return {
+        campaign: {
+            quadrant: years[0]
+            for quadrant, years in quadrants.items()
+            if years
+        }
+        for campaign, quadrants in ranked.items()
+    }
 
 
 def serialize_monthly(rows: list[MonthlyClimate]) -> list[dict[str, Any]]:
