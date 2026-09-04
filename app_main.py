@@ -454,12 +454,28 @@ def _render_result(result: LotResult) -> None:
                     f"el año principal {metadata.get('primary_representative_year')} "
                     "no tenía una escena que cumpliera el control de calidad."
                 )
+            requested_buffer = int(
+                metadata.get("requested_buffer_m", metadata.get("buffer_m", 0)) or 0
+            )
+            effective_buffer = int(
+                metadata.get("effective_buffer_m", metadata.get("buffer_m", 0)) or 0
+            )
+            if effective_buffer < requested_buffer:
+                st.warning(
+                    f"El lote pasó el control de calidad, pero el contexto de "
+                    f"{requested_buffer} m no. Para esta escena se redujo automáticamente "
+                    f"el contexto a {effective_buffer} m."
+                )
+            selection_quality = metadata.get("selection", {})
             st.caption(
                 f"Nubosidad de escena: {metadata.get('cloud_percent', 0):.2f}% · "
                 f"píxeles válidos: {metadata.get('valid_pixel_percent', 0):.1f}% · "
-                f"área enmascarada: {metadata.get('contaminated_percent', 0):.2f}% · "
+                f"área enmascarada en lote: "
+                f"{selection_quality.get('lot_contaminated_percent', 0):.2f}% · "
+                f"área enmascarada en contexto: "
+                f"{metadata.get('contaminated_percent', 0):.2f}% · "
                 f"resolución: {metadata.get('resolution_m', 10):.0f} m · "
-                f"buffer: {metadata.get('buffer_m', 0)} m"
+                f"buffer efectivo: {effective_buffer} m"
             )
             for column, product in zip(st.columns(3), ["NDVI", "IR", "RGB"], strict=True):
                 raster = scene_dir / metadata.get("products", {}).get(product, f"{product}.tif")

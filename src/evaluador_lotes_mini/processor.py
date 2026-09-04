@@ -244,7 +244,7 @@ def _export_first_valid_representative(
                 item,
                 lot.geometry,
                 scene_dir,
-                buffer_m=options.buffer_m,
+                buffer_m=selection.effective_buffer_m,
                 file_prefix=selection.acquisition_date,
                 file_suffix=f"{campaign}_{_qgis_quadrant_token(quadrant)}",
             )
@@ -256,6 +256,8 @@ def _export_first_valid_representative(
                     "primary_representative_year": candidate_years[0],
                     "representative_rank": rank,
                     "representative_candidates_tried": candidate_years[:rank],
+                    "requested_buffer_m": options.buffer_m,
+                    "effective_buffer_m": selection.effective_buffer_m,
                     "selection": asdict(selection),
                 }
             )
