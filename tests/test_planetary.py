@@ -6,6 +6,10 @@ from shapely.geometry import box, mapping
 
 from evaluador_lotes_mini.imagery import planetary
 from evaluador_lotes_mini.imagery.planetary import (
+    MAX_REPRESENTATIVE_CONTEXT_CONTAMINATION_PERCENT,
+    MAX_REPRESENTATIVE_CONTEXT_PATCH_M2,
+    MAX_REPRESENTATIVE_LOT_CONTAMINATION_PERCENT,
+    MAX_REPRESENTATIVE_LOT_PATCH_M2,
     PlanetaryImagery,
     _buffer_fallbacks,
     _deduplicate_acquisitions,
@@ -53,6 +57,34 @@ def test_cloud_rule_rejects_large_contiguous_patch() -> None:
     assert quality["contaminated_percent"] < 0.5
     assert quality["largest_patch_m2"] == 1_200
     assert quality["passes"] is False
+
+
+def test_representative_lot_and_context_use_practical_patch_limits() -> None:
+    footprint = np.ones((100, 100), dtype=bool)
+    lot_clear = footprint.copy()
+    lot_clear[10:12, 10:15] = False
+    context_clear = footprint.copy()
+    context_clear[10:15, 10:15] = False
+
+    lot_quality = scene_quality(
+        lot_clear,
+        footprint,
+        20,
+        max_contamination_percent=MAX_REPRESENTATIVE_LOT_CONTAMINATION_PERCENT,
+        max_patch_area_m2=MAX_REPRESENTATIVE_LOT_PATCH_M2,
+    )
+    context_quality = scene_quality(
+        context_clear,
+        footprint,
+        20,
+        max_contamination_percent=MAX_REPRESENTATIVE_CONTEXT_CONTAMINATION_PERCENT,
+        max_patch_area_m2=MAX_REPRESENTATIVE_CONTEXT_PATCH_M2,
+    )
+
+    assert lot_quality["largest_patch_m2"] == 4_000
+    assert lot_quality["passes"] is True
+    assert context_quality["largest_patch_m2"] == 10_000
+    assert context_quality["passes"] is True
 
 
 def test_qgis_product_filename_is_short_and_predictable() -> None:

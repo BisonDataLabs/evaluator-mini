@@ -31,6 +31,10 @@ S2_COLLECTION = "sentinel-2-l2a"
 CLEAR_SCL = {4, 5, 6, 11}
 MAX_CLIP_CONTAMINATION_PERCENT = 0.5
 MAX_CONTAMINATED_PATCH_M2 = 1_000
+MAX_REPRESENTATIVE_LOT_CONTAMINATION_PERCENT = 0.5
+MAX_REPRESENTATIVE_LOT_PATCH_M2 = 5_000
+MAX_REPRESENTATIVE_CONTEXT_CONTAMINATION_PERCENT = 2.5
+MAX_REPRESENTATIVE_CONTEXT_PATCH_M2 = 15_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +208,20 @@ class PlanetaryImagery:
     ) -> tuple[list[Path], dict[str, Any]]:
         context = buffered_wgs84(lot_geometry, buffer_m)
         quality_grid = grid_for_geometry(context, resolution=20)
-        quality = read_scene_quality(item, quality_grid)
+        quality = read_scene_quality(
+            item,
+            quality_grid,
+            max_contamination_percent=(
+                MAX_REPRESENTATIVE_CONTEXT_CONTAMINATION_PERCENT
+                if buffer_m
+                else MAX_REPRESENTATIVE_LOT_CONTAMINATION_PERCENT
+            ),
+            max_patch_area_m2=(
+                MAX_REPRESENTATIVE_CONTEXT_PATCH_M2
+                if buffer_m
+                else MAX_REPRESENTATIVE_LOT_PATCH_M2
+            ),
+        )
         if not quality["passes"]:
             raise RuntimeError(str(quality["reason"]))
         grid = grid_for_geometry(context)
@@ -344,7 +361,13 @@ def read_ndvi_false_color(
     return ndvi, valid, false_color
 
 
-def read_scene_quality(item: Item, grid: RasterGrid) -> dict[str, Any]:
+def read_scene_quality(
+    item: Item,
+    grid: RasterGrid,
+    *,
+    max_contamination_percent: float = MAX_CLIP_CONTAMINATION_PERCENT,
+    max_patch_area_m2: float = MAX_CONTAMINATED_PATCH_M2,
+) -> dict[str, Any]:
     """Measure holes/cloud masks inside a clip and apply the APB acceptance rule."""
     scl = read_asset(
         item.assets["SCL"].href,
@@ -354,7 +377,13 @@ def read_scene_quality(item: Item, grid: RasterGrid) -> dict[str, Any]:
         nodata=0,
     )
     clear = np.isin(scl, list(CLEAR_SCL)) & grid.inside_mask
-    return scene_quality(clear, grid.inside_mask, grid.resolution)
+    return scene_quality(
+        clear,
+        grid.inside_mask,
+        grid.resolution,
+        max_contamination_percent=max_contamination_percent,
+        max_patch_area_m2=max_patch_area_m2,
+    )
 
 
 def read_scene_quality_buffers(
@@ -391,7 +420,21 @@ def read_scene_quality_buffers(
             all_touched=True,
         )
         clear = classified_clear & footprint
-        results[buffer_m] = scene_quality(clear, footprint, grid.resolution)
+        results[buffer_m] = scene_quality(
+            clear,
+            footprint,
+            grid.resolution,
+            max_contamination_percent=(
+                MAX_REPRESENTATIVE_LOT_CONTAMINATION_PERCENT
+                if buffer_m == 0
+                else MAX_REPRESENTATIVE_CONTEXT_CONTAMINATION_PERCENT
+            ),
+            max_patch_area_m2=(
+                MAX_REPRESENTATIVE_LOT_PATCH_M2
+                if buffer_m == 0
+                else MAX_REPRESENTATIVE_CONTEXT_PATCH_M2
+            ),
+        )
     return results
 
 
